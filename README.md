@@ -1,9 +1,9 @@
 # priompt db-adapters
 
 **The filing cabinet of Priompt.** Everything a
-[Priompt](https://github.com/) server knows — every prompt, every historical
+[Priompt](https://github.com/priompt/priompt) server knows — every prompt, every historical
 version, every branch pointer — is physically kept by this library, in a real
-database, with optional encryption so a stolen database file is useless.
+database, with optional encryption to protect prompt content in a stolen database file.
 
 It ships two backends and is deliberately structured so adding a third is a
 one-file job:
@@ -54,22 +54,28 @@ Set one environment variable and prompt content is encrypted with
 export PRIOMPT_ENCRYPTION_KEY=$(head -c32 /dev/urandom | base64)   # base64 of 32 bytes
 ```
 
-Think of it as the cabinet's lock: anyone who steals the drawer (the `.db`
-file, a Postgres dump) gets ciphertext. The honest fine print:
+Only the `template` and `slots` columns are encrypted. Other data in a stolen
+`.db` file or Postgres dump remains readable. The honest fine print:
 
 - **At rest, not end-to-end** — the server holds the key and decrypts to do
   its job (validation, semantic diff).
 - **No migration to turn it on** — encrypted values carry a marker, so old
   plaintext rows stay readable while new writes are encrypted.
-- The `version_hash` column stays plaintext (it's a fingerprint, not content),
-  so caching and deduplication keep working.
+- The following columns stay plaintext:
+  - `prompts`: `uri`, `version_hash`.
+  - `commits`: `hash`, `uri`, `version_hash`, `parent`, `parent2`, `author`,
+    `message`, `created_at`.
+  - `refs`: all columns (`uri`, `branch`, `commit_hash`).
+  This metadata supports lookup, caching, deduplication and history traversal.
+  Commit messages can describe prompt content, so treat them as non-secret.
 - **Lose the key and encrypted rows are unrecoverable.** Every process that
   opens the same database must share the key.
 
 ## How the pluggable-backend part works
 
 All SQL in this library is portable and written **once**, in `?`-placeholder
-style. A backend ("dialect") only tells the library three things:
+style. A backend ("dialect") supplies its driver, DSN handling, placeholder
+rewriting and connection-pool limit:
 
 ```mermaid
 flowchart TD
@@ -84,6 +90,14 @@ type dialect struct {
     driver string                // database/sql driver name
     match  func(dsn string) bool // does this DSN belong to this backend?
     rebind func(q string) string // ?-style placeholders -> native style
+
+    // dsn optionally rewrites the DSN before it reaches the driver — where a
+    // backend needs connection settings that are correctness, not tuning
+    // (SQLite's WAL and busy timeout). nil means "use the DSN as given".
+    dsn func(dsn string) string
+    // maxConns caps the connection pool. 0 means unlimited (the database/sql
+    // default); SQLite sets 1 because it serialises writes regardless.
+    maxConns int
 }
 ```
 
